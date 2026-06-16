@@ -1,147 +1,132 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
-import { API_CONFIG, getAvailableApiSites } from '@/lib/config';
+import { getAvailableApiSites } from '@/lib/config';
 import { SearchResult } from '@/lib/types';
 
-export const runtime = 'edge'; // ✅ 改成 edge（关键）
+export const runtime = 'edge';
 
-interface CmsVideoItem {
-  vod_id: string | number;
-  vod_name: string;
-  vod_pic: string;
-  vod_remarks?: string;
-  vod_year?: string;
-  vod_play_from?: string;
-  vod_play_url?: string;
+// ========================
+// 超时工具
+// ========================
+function timeoutPromise<T>(p: Promise<T>, ms: number, msg: string) {
+  let timer: any;
+
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(msg)), ms);
+  });
+
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
-interface CmsVideoResponse {
-  list?: CmsVideoItem[];
-  total?: number;
-  page?: number;
-  pagecount?: number;
-}
-
-/** 超时 fetch（真正可靠） */
-async function fetchWithTimeout(url: string, timeout = 5000) {
+// ========================
+// fetch（Cloudflare安全版）
+// ========================
+async function safeFetch(url: string) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), 4000);
 
   try {
-    const res = await fetch(url, {
-      headers: API_CONFIG.search.headers,
+    return await fetch(url, {
       signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+      },
     });
-    return res;
   } finally {
     clearTimeout(timer);
   }
 }
 
-export async function GET(request: NextRequest) {
-  const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo?.username) {
+// ========================
+// 主接口
+// ========================
+export async function GET(req: NextRequest) {
+  const auth = getAuthInfoFromCookie(req);
+  if (!auth?.username) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const { searchParams } = new URL(request.url);
+  const { searchParams } = new URL(req.url);
   const sourceKey = searchParams.get('source');
   const keyword = searchParams.get('keyword');
-  const page = searchParams.get('page') || '1';
 
-  if (!sourceKey || !keyword?.trim()) {
-    return NextResponse.json({ error: '参数错误' }, { status: 400 });
+  if (!sourceKey || !keyword) {
+    return NextResponse.json({ error: 'bad request' }, { status: 400 });
   }
 
   try {
-    const includeSpecialSources = searchParams.get('special') === '1';
-    const apiSites = await getAvailableApiSites(
-      authInfo.username,
-      includeSpecialSources
+    const sites = await getAvailableApiSites(auth.username, false);
+
+    // ========================
+    // 🔥 1. 优先匹配源
+    // ========================
+    const target = sites.find(s => s.key === sourceKey);
+    if (!target) {
+      return NextResponse.json({ results: [] });
+    }
+
+    // ========================
+    // 🔥 2. 搜索 URL
+    // ========================
+    const url =
+      `${target.api}?ac=videolist&wd=` +
+      encodeURIComponent(keyword) +
+      `&pg=1`;
+
+    // ========================
+    // 🔥 3. 超时保护（5秒硬限制）
+    // ========================
+    const res = await timeoutPromise(
+      safeFetch(url),
+      5000,
+      'search timeout'
     );
 
-    const targetSite = apiSites.find((s) => s.key === sourceKey);
-
-    if (!targetSite) {
-      return NextResponse.json({ error: '未找到源' }, { status: 404 });
+    if (!res.ok) {
+      return NextResponse.json({ results: [] });
     }
 
-    // ✅ 拼接搜索 URL
-    const searchUrl =
-      `${targetSite.api}?ac=videolist&wd=` +
-      encodeURIComponent(keyword) +
-      `&pg=${page}`;
-
-    // ✅ Cloudflare safe fetch（5秒）
-    const searchResponse = await fetchWithTimeout(searchUrl, 5000);
-
-    if (!searchResponse.ok) {
-      return NextResponse.json({
-        results: [],
-        total: 0,
-        page: Number(page),
-        pageCount: 0,
-      });
-    }
-
-    let searchData: CmsVideoResponse;
-
+    let data;
     try {
-      searchData = await searchResponse.json();
+      data = await res.json();
     } catch {
-      return NextResponse.json({
-        results: [],
-        total: 0,
-        page: Number(page),
-        pageCount: 0,
-      });
+      return NextResponse.json({ results: [] });
     }
 
-    const list = Array.isArray(searchData.list) ? searchData.list : [];
+    const list = Array.isArray(data.list) ? data.list : [];
 
-    // ⚠️ 限制数量（防 CPU 爆炸）
-    const safeList = list.slice(0, 20);
+    // ========================
+    // 🔥 4. 限制 CPU（关键优化）
+    // ========================
+    const safeList = list.slice(0, 10);
 
-    const results: SearchResult[] = safeList.map((item) => {
-      const episodes: string[] = [];
-      const episodes_titles: string[] = [];
+    const results: SearchResult[] = [];
 
-      if (item.vod_play_url && item.vod_play_from) {
-        item.vod_play_url.split('#').forEach((ep) => {
-          const [name, url] = ep.split('$');
-          if (name && url) {
-            episodes.push(url.trim());
-            episodes_titles.push(name.trim());
-          }
+    for (const item of safeList) {
+      try {
+        results.push({
+          id: String(item.vod_id || ''),
+          title: item.vod_name || '',
+          poster: item.vod_pic || '',
+          year: item.vod_year || 'unknown',
+          episodes: [],
+          episodes_titles: [],
+          source: target.key,
+          source_name: target.name,
         });
+      } catch {
+        continue;
       }
-
-      return {
-        id: String(item.vod_id || ''),
-        title: item.vod_name || '',
-        poster: item.vod_pic || '',
-        year: item.vod_year || 'unknown',
-        episodes,
-        episodes_titles,
-        source: targetSite.key,
-        source_name: targetSite.name,
-      };
-    });
+    }
 
     return NextResponse.json({
       results,
-      total: searchData.total || 0,
-      page: Number(page),
-      pageCount: searchData.pagecount || 0,
+      total: data.total || 0,
+      page: 1,
+      pageCount: data.pagecount || 0,
     });
   } catch (e) {
     console.error('search error:', e);
-
-    return NextResponse.json({
-      results: [],
-      total: 0,
-      page: Number(page),
-      pageCount: 0,
-    });
+    return NextResponse.json({ results: [] });
   }
 }
