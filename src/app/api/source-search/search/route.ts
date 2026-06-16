@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { API_CONFIG, getAvailableApiSites } from '@/lib/config';
 import { SearchResult } from '@/lib/types';
 
-export const runtime = 'nodejs';
+export const runtime = 'edge'; // ✅ 改成 edge（关键）
 
 interface CmsVideoItem {
   vod_id: string | number;
@@ -23,12 +22,25 @@ interface CmsVideoResponse {
   pagecount?: number;
 }
 
-/**
- * 在指定视频源中搜索视频
- */
+/** 超时 fetch（真正可靠） */
+async function fetchWithTimeout(url: string, timeout = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const res = await fetch(url, {
+      headers: API_CONFIG.search.headers,
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function GET(request: NextRequest) {
   const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
+  if (!authInfo?.username) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
@@ -37,76 +49,76 @@ export async function GET(request: NextRequest) {
   const keyword = searchParams.get('keyword');
   const page = searchParams.get('page') || '1';
 
-  if (!sourceKey) {
-    return NextResponse.json(
-      { error: '缺少参数: source' },
-      { status: 400 }
-    );
-  }
-
-  if (!keyword || keyword.trim() === '') {
-    return NextResponse.json(
-      { error: '缺少参数: keyword' },
-      { status: 400 }
-    );
+  if (!sourceKey || !keyword?.trim()) {
+    return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
 
   try {
-    const includeSpecialSources = request.nextUrl.searchParams.get('special') === '1';
-    const apiSites = await getAvailableApiSites(authInfo.username, includeSpecialSources);
-    const targetSite = apiSites.find((site) => site.key === sourceKey);
+    const includeSpecialSources = searchParams.get('special') === '1';
+    const apiSites = await getAvailableApiSites(
+      authInfo.username,
+      includeSpecialSources
+    );
+
+    const targetSite = apiSites.find((s) => s.key === sourceKey);
 
     if (!targetSite) {
-      return NextResponse.json(
-        { error: `未找到指定的视频源: ${sourceKey}` },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: '未找到源' }, { status: 404 });
     }
 
-    // 请求搜索结果
-    const searchUrl = `${targetSite.api}?ac=videolist&wd=${encodeURIComponent(keyword)}&pg=${page}`;
-    const searchResponse = await fetch(searchUrl, {
-      headers: API_CONFIG.search.headers,
-      signal: AbortSignal.timeout(10000),
-    });
+    // ✅ 拼接搜索 URL
+    const searchUrl =
+      `${targetSite.api}?ac=videolist&wd=` +
+      encodeURIComponent(keyword) +
+      `&pg=${page}`;
+
+    // ✅ Cloudflare safe fetch（5秒）
+    const searchResponse = await fetchWithTimeout(searchUrl, 5000);
 
     if (!searchResponse.ok) {
-      throw new Error('搜索失败');
-    }
-
-    const searchData: CmsVideoResponse = await searchResponse.json();
-
-    if (!searchData.list || !Array.isArray(searchData.list)) {
       return NextResponse.json({
         results: [],
         total: 0,
-        page: parseInt(page),
+        page: Number(page),
         pageCount: 0,
       });
     }
 
-    // 转换为 SearchResult 格式
-    const results: SearchResult[] = searchData.list.map((item) => {
+    let searchData: CmsVideoResponse;
+
+    try {
+      searchData = await searchResponse.json();
+    } catch {
+      return NextResponse.json({
+        results: [],
+        total: 0,
+        page: Number(page),
+        pageCount: 0,
+      });
+    }
+
+    const list = Array.isArray(searchData.list) ? searchData.list : [];
+
+    // ⚠️ 限制数量（防 CPU 爆炸）
+    const safeList = list.slice(0, 20);
+
+    const results: SearchResult[] = safeList.map((item) => {
       const episodes: string[] = [];
       const episodes_titles: string[] = [];
 
-      // 解析播放信息
       if (item.vod_play_url && item.vod_play_from) {
-        const playUrls = item.vod_play_url.split('#');
-        playUrls.forEach((episodeStr) => {
-          if (episodeStr.trim()) {
-            const [name, url] = episodeStr.split('$');
-            if (name && url) {
-              episodes.push(url.trim());
-              episodes_titles.push(name.trim());
-            }
+        item.vod_play_url.split('#').forEach((ep) => {
+          const [name, url] = ep.split('$');
+          if (name && url) {
+            episodes.push(url.trim());
+            episodes_titles.push(name.trim());
           }
         });
       }
 
       return {
-        id: item.vod_id.toString(),
-        title: item.vod_name,
+        id: String(item.vod_id || ''),
+        title: item.vod_name || '',
         poster: item.vod_pic || '',
         year: item.vod_year || 'unknown',
         episodes,
@@ -119,11 +131,17 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       results,
       total: searchData.total || 0,
-      page: parseInt(page),
+      page: Number(page),
       pageCount: searchData.pagecount || 0,
     });
-  } catch (error) {
-    console.error('Failed to search videos:', error);
-    return NextResponse.json({ error: '搜索失败' }, { status: 500 });
+  } catch (e) {
+    console.error('search error:', e);
+
+    return NextResponse.json({
+      results: [],
+      total: 0,
+      page: Number(page),
+      pageCount: 0,
+    });
   }
 }
